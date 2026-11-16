@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "Bash(.venv-pyside/Scripts/python -m ruff check:*)",
+      "Bash(.venv-pyside/Scripts/python -m ruff format:*)",
+      "Bash(.venv-pyside/Scripts/python -m pytest:*)",
+      "Bash(.venv-pyside/Scripts/python -m compileall:*)",
+      "Bash(.venv-pyside/Scripts/python -m wx4app:*)",
+      "Bash(git status)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)"
+    ],
+    "deny": [
+      "Read(./微信导出/**)",
+      "Read(**/*.db)",
+      "Read(**/*.db-wal)",
+      "Read(**/keys.json)",
+      "Bash(rm -rf:*)",
+      "Bash(del /s:*)"
+    ]
+  }
+}

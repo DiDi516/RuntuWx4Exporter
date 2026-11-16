@@ -1,0 +1,62 @@
+[project]
+name = "runtu-wx4-exporter"
+version = "1.0.0"
+description = "闰土微信记录导出器 — 微信 4.x 聊天记录本地查看与导出（Windows 桌面版）"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "runtu" }]
+keywords = ["wechat", "wechat4", "export", "chat-history", "pyside6"]
+classifiers = [
+    "Environment :: Win32 (MS Windows)",
+    "Intended Audience :: End Users/Desktop",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Utilities",
+]
+
+dependencies = [
+    "PySide6>=6.6",
+    "pycryptodome>=3.20",
+    "zstandard>=0.22",
+    "pillow>=10.0",
+    "av>=12.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.6", "pyinstaller>=6.5"]
+
+[project.scripts]
+wx4app = "wx4app.__main__:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["wx4app", "wx4view", "wx4export", "wxmanager"]
+
+[tool.setuptools.package-data]
+wx4app = ["assets/*.png", "assets/*.ico"]
+
+# ---------------------------------------------------------------- 代码风格
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+exclude = [".venv", ".venv-pyside", "build", "build-pyside", "dist", "dist2", "docs", "tools"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "C4"]
+ignore = [
+    "E501",  # 中文注释/长字符串多，交给 formatter 处理
+    "B008",  # Qt 里常见的函数默认值写法
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["wx4app", "wx4view", "wx4export", "wxmanager"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

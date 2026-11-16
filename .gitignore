@@ -1,0 +1,48 @@
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+dist2/
+*.spec
+.venv/
+.venv-*/
+venv/
+env/
+
+# ---------- 打包/测试产物 ----------
+build-pyside/
+*.exe
+*.zip
+.pytest_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+
+# ---------- 本地数据（绝不入库） ----------
+微信导出/
+_export_test/
+_html_test*/
+_file_test/
+demo-out/
+*.db
+*.db-wal
+*.db-shm
+keys.json
+config.json
+
+# ---------- 日志/临时 ----------
+*.log
+*.tmp
+
+# ---------- git 备份目录 ----------
+.git_old/
+
+# ---------- IDE / 系统 ----------
+.idea/
+.vscode/
+Thumbs.db
+desktop.ini
+.DS_Store

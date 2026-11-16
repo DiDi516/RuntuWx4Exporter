@@ -1,0 +1,6 @@
+# 运行时依赖（桌面版 + 导出/预览）
+PySide6>=6.6          # 桌面界面
+pycryptodome>=3.20    # 微信数据库/图片 AES 解密
+zstandard>=0.22       # 消息内容 zstd 解压
+pillow>=10.0          # 图片处理 / ico 生成
+av>=12.0              # HEVC/H.265 图片（部分表情/贴纸）解码
