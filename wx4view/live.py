@@ -226,8 +226,10 @@ class LiveSource:
                 sql += " LIMIT ?"
                 args.append(limit + 1)
             try:
+                # 必须当场物化成 dict：sqlite3.Row 在连接关闭后访问会读到已释放内存
+                # （多线程下表现为 access violation / 进程直接退出）
                 for r in conn.execute(sql, args):
-                    rows.append((r, n2id))
+                    rows.append((dict(r), n2id))
             except sqlite3.DatabaseError:
                 pass
             finally:
@@ -244,6 +246,33 @@ class LiveSource:
             seen.add(key)
             uniq.append(item)
         return uniq
+
+    def _iter_rows(self, username: str, page: int = 2000, start_ts: int = 0,
+                   end_ts: int = 0, only_images: bool = False,
+                   only_files: bool = False):
+        """按时间倒序分页取消息行，避免一次性把几万条（含 blob）读进内存。
+
+        每页返回 [(row_dict, name2id), ...]，调用方自行解析。
+        """
+        before = 0
+        seen: set[tuple[int, int]] = set()
+        while True:
+            rows = self._fetch(username, page, before=before or None,
+                               start_ts=start_ts, end_ts=end_ts,
+                               only_images=only_images, only_files=only_files)
+            fresh = []
+            for r, n2id in rows:
+                key = (r["create_time"] or 0, r["local_id"] or 0)
+                if key in seen:
+                    continue
+                seen.add(key)
+                fresh.append((r, n2id))
+            if not fresh:
+                break
+            yield fresh
+            if len(rows) < page:
+                break
+            before = min(r["create_time"] or 0 for r, _ in fresh) + 1
 
     def _counts(self, username: str) -> tuple[int, int, int, int]:
         """(消息总数, 图片数, 最早时间, 最晚时间)，结果缓存。"""
@@ -373,6 +402,20 @@ class LiveSource:
             "next_before": msgs[0]["ts"] if msgs else 0,
         }
 
+    def images_page(self, username: str, before: int | None = None,
+                    limit: int = 60) -> dict:
+        """按时间倒序分页取图片（滚动加载用，避免一次性解析几千条）。"""
+        rows = self._fetch(username, limit, before=before, only_images=True)
+        has_more = len(rows) > limit
+        rows = rows[:limit]
+        msgs = self._parse_rows(rows, username)
+        items = [{"t": m["t"], "who": m["who"], "me": m["me"],
+                  "src": m["src"], "ts": m["ts"]} for m in msgs if m.get("src")]
+        total = self._counts(username)[1]
+        # 展示按从新到旧
+        items.reverse()
+        return {"items": items, "has_more": has_more, "total": total}
+
     def images(self, username: str, limit: int = 2000) -> list[dict]:
         rows = self._fetch(username, limit, only_images=True)
         return [{"t": m["t"], "who": m["who"], "me": m["me"], "src": m["src"], "ts": m["ts"]}
@@ -432,9 +475,10 @@ class LiveSource:
     def export_files(self, username: str, out_root: Path, progress=None,
                      should_stop=None, start_ts: int = 0, end_ts: int = 0,
                      layout: str = "date") -> dict:
-        msgs = self._parse_rows(
-            self._fetch(username, 0, only_files=True, start_ts=start_ts, end_ts=end_ts),
-            username)
+        msgs: list[dict] = []
+        for page_rows in self._iter_rows(username, start_ts=start_ts, end_ts=end_ts,
+                                         only_files=True):
+            msgs = self._parse_rows(page_rows, username) + msgs
         name = self.names.get(username, username)
         base_dir = Path(out_root) / _safe(name)
         file_root = base_dir / "文件"
@@ -513,9 +557,10 @@ class LiveSource:
     def export_images(self, username: str, out_root: Path, progress=None,
                       should_stop=None, start_ts: int = 0, end_ts: int = 0,
                       layout: str = "date") -> dict:
-        msgs = self._parse_rows(
-            self._fetch(username, 0, only_images=True, start_ts=start_ts, end_ts=end_ts),
-            username)
+        msgs: list[dict] = []
+        for page_rows in self._iter_rows(username, start_ts=start_ts, end_ts=end_ts,
+                                         only_images=True):
+            msgs = self._parse_rows(page_rows, username) + msgs
         name = self.names.get(username, username)
         base_dir = Path(out_root) / _safe(name)
         img_root = base_dir / "图片"
@@ -629,8 +674,9 @@ class LiveSource:
     def export_chat(self, username: str, out_root: Path, start_ts: int = 0,
                     end_ts: int = 0, images_map: dict | None = None,
                     files_map: dict | None = None) -> dict:
-        msgs = self._parse_rows(
-            self._fetch(username, 0, start_ts=start_ts, end_ts=end_ts), username)
+        msgs: list[dict] = []
+        for page_rows in self._iter_rows(username, start_ts=start_ts, end_ts=end_ts):
+            msgs = self._parse_rows(page_rows, username) + msgs
         name = self.names.get(username, username)
         base_dir = Path(out_root) / _safe(name)
         base_dir.mkdir(parents=True, exist_ok=True)

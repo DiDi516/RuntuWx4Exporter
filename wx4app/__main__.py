@@ -11,6 +11,12 @@ def _default_export_dir() -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    # 导出子进程模式：不加载 Qt，直接跑导出任务
+    if len(argv) >= 2 and argv[0] == "--export-job":
+        from .job_runner import main as run_job
+        return run_job([argv[1]])
+
     ap = argparse.ArgumentParser(prog="wx4app", description="微信聊天记录桌面版（PySide6）")
     ap.add_argument("--account", help="微信账号目录（默认自动探测）")
     ap.add_argument("--files-only", action="store_true", help="只浏览已导出的目录")

@@ -382,6 +382,14 @@ class ChatView(QScrollArea):
         self._img_timer.setInterval(16)
         self._img_timer.timeout.connect(self._drain_images)
 
+    def pause_images(self):
+        """暂时解码（切到图片页时避免两边抢解码）。"""
+        self._img_timer.stop()
+
+    def resume_images(self):
+        if _PENDING_IMAGES:
+            self._img_timer.start()
+
     def _drain_images(self):
         for _ in range(3):
             if not _PENDING_IMAGES:
@@ -468,9 +476,11 @@ class ChatView(QScrollArea):
 
 
 class ImagesView(QWidget):
-    """图片墙：白色卡片 + 渐进加载。"""
+    """图片墙：懒加载 + 滚动到底自动加载下一页。"""
 
     open_image = Signal(int)
+
+    PAGE_HINT = 400  # 距底部多少像素开始预加载
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -499,25 +509,79 @@ class ImagesView(QWidget):
         self._timer.setInterval(16)
         self._timer.timeout.connect(self._load_batch)
 
-    def load(self, imgs: list[dict], path_of, limit: int = 400):
+        self.items: list[dict] = []
+        self._fetch = None
+        self._path_of = None
+        self._has_more = False
+        self._loading = False
+        self._total = 0
+        self.list.verticalScrollBar().valueChanged.connect(self._maybe_load)
+
+    # ---------- 对外 ----------
+    def reset(self, fetch_page, path_of):
+        """fetch_page(before) -> {items, has_more, total}；path_of(msg) -> Path|None"""
         self.list.clear()
         self._pending.clear()
-        if not imgs:
-            self.tip.setText("该会话没有图片")
+        self._timer.stop()
+        self.items = []
+        self._fetch = fetch_page
+        self._path_of = path_of
+        self._has_more = True
+        self._loading = False
+        self._total = 0
+        self.tip.setText("正在加载图片…")
+        self._load_next()
+
+    # ---------- 分页 ----------
+    def _load_next(self):
+        if self._loading or not self._has_more or self._fetch is None:
             return
-        show = imgs[-limit:]
-        self.tip.setText(f"共 {len(imgs)} 张图片" + (f"，显示最近 {limit} 张" if len(imgs) > limit else ""))
+        self._loading = True
+        before = self.items[-1]["ts"] if self.items else None
+        QTimer.singleShot(0, lambda: self._do_load(before))
+
+    def _do_load(self, before):
+        page = None
+        try:
+            page = self._fetch(before)
+        except Exception:  # noqa: BLE001
+            page = None
+        self._loading = False
+        if not page or not page.get("items"):
+            self._has_more = False
+            self._update_tip()
+            return
+        self._total = page.get("total") or self._total
+        self._has_more = bool(page.get("has_more"))
+        self._append(page["items"])
+        self._update_tip()
+        # 内容不足一屏时继续加载
+        QTimer.singleShot(60, self._maybe_load)
+
+    def _append(self, items: list[dict]):
         placeholder = QPixmap(150, 150)
         placeholder.fill(QColor("#F5F7FA"))
-        for m in show:
+        for m in items:
             text = f"{(m.get('t') or '')[5:16]}  {'我' if m.get('me') else m.get('who', '')}"
             item = QListWidgetItem(text)
             item.setIcon(placeholder)
             self.list.addItem(item)
-            p = path_of(m)
+            self.items.append(m)
+            p = self._path_of(m) if self._path_of else None
             if p:
                 self._pending.append((item, str(p)))
-        self._timer.start()
+        if self._pending:
+            self._timer.start()
+
+    def _update_tip(self):
+        shown, total = len(self.items), self._total or len(self.items)
+        more = "，继续下滑加载更多" if self._has_more else ""
+        self.tip.setText(f"共 {total} 张图片 · 已加载 {shown} 张{more}")
+
+    def _maybe_load(self, *args):
+        bar = self.list.verticalScrollBar()
+        if bar.maximum() - bar.value() <= self.PAGE_HINT:
+            self._load_next()
 
     def _load_batch(self):
         for _ in range(8):

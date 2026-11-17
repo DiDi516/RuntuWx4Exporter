@@ -2,10 +2,15 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
+import tempfile
+import threading
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtCore import QObject, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
@@ -43,88 +48,154 @@ TYPES = [("all", "全部类型"), ("text", "文本"), ("image", "图片"), ("fil
 
 
 # ---------------------------------------------------------------- 线程
-class InitWorker(QThread):
+class WorkerSignals(QObject):
+    """普通线程 -> 主线程的信号桥（避免 QThread 里跑 sqlite 的稳定性问题）。"""
+
     ready = Signal(object)
-    failed = Signal(str)
-
-    def __init__(self, account: str | None):
-        super().__init__()
-        self.account = account
-
-    def run(self):
-        try:
-            self.ready.emit(LiveSource(self.account))
-        except Exception as exc:  # noqa: BLE001
-            self.failed.emit(f"{type(exc).__name__}: {exc}")
-
-
-class ExportWorker(QThread):
+    done = Signal(object)
+    failed = Signal(object)
     progress = Signal(int, int)
-    done = Signal(dict)
-    failed = Signal(str)
+    progress_text = Signal(int, int, str)
+    finished = Signal()
 
-    def __init__(self, fn):
-        super().__init__()
-        self.fn = fn
+
+class InitWorker(threading.Thread):
+    def __init__(self, account: str | None):
+        super().__init__(daemon=True)
+        self.account = account
+        self.signals = WorkerSignals()
 
     def run(self):
         try:
-            self.done.emit(self.fn(lambda i, t: self.progress.emit(i, t)))
+            self.signals.ready.emit(LiveSource(self.account))
         except Exception as exc:  # noqa: BLE001
-            self.failed.emit(f"{type(exc).__name__}: {exc}")
+            self.signals.failed.emit(f"{type(exc).__name__}: {exc}")
 
 
-class MessagesWorker(QThread):
-    done = Signal(str, dict)
-    failed = Signal(str, str)
-
+class MessagesWorker(threading.Thread):
     def __init__(self, source, cid: str, limit: int = 150, before=None):
-        super().__init__()
+        super().__init__(daemon=True)
         self.source = source
         self.cid = cid
         self.limit = limit
         self.before = before
+        self.signals = WorkerSignals()
 
     def run(self):
         try:
-            self.done.emit(self.cid, self.source.messages(
-                self.cid, limit=self.limit, before=self.before))
+            data = self.source.messages(self.cid, limit=self.limit, before=self.before)
+            self.signals.done.emit({"cid": self.cid, "data": data})
         except Exception as exc:  # noqa: BLE001
-            self.failed.emit(self.cid, f"{type(exc).__name__}: {exc}")
+            self.signals.failed.emit(
+                {"cid": self.cid, "error": f"{type(exc).__name__}: {exc}"})
+        finally:
+            self.signals.finished.emit()
 
 
-class ExportAllWorker(QThread):
-    progress = Signal(int, int, str)
-    done = Signal(dict)
+class ExportJob(QObject):
+    """独立进程导出：子进程干活，父进程轮询进度文件，UI 永不卡死、也不会被拖崩。"""
+
+    done = Signal(object)
     failed = Signal(str)
+    progress_text = Signal(int, int, str)
 
-    def __init__(self, source, root: Path, include_images: bool,
-                 start_ts: int = 0, end_ts: int = 0, layout: str = "date",
-                 include_files: bool = False):
+    def __init__(self, spec: dict):
         super().__init__()
-        self.source = source
-        self.root = root
-        self.include_images = include_images
-        self.start_ts = start_ts
-        self.end_ts = end_ts
-        self.layout = layout
-        self.include_files = include_files
-        self._stop = False
+        self.spec = spec
+        self.proc: subprocess.Popen | None = None
+        self._spec_path: str | None = None
+        self._prog_path: str | None = None
+        self._pos = 0
+        self._buf = ""
+        self._cancelled = False
+        self._result: dict | None = None
+        self._error: str | None = None
+        self._timer = QTimer(self)
+        self._timer.setInterval(120)
+        self._timer.timeout.connect(self._poll)
+
+    def start(self):
+        fd, spec_path = tempfile.mkstemp(prefix="wx4job_", suffix=".json")
+        os.close(fd)
+        fd, prog_path = tempfile.mkstemp(prefix="wx4job_", suffix=".log")
+        os.close(fd)
+        self._spec_path, self._prog_path = spec_path, prog_path
+        payload = dict(self.spec, progress_path=prog_path)
+        Path(spec_path).write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+        if getattr(sys, "frozen", False):
+            cmd = [sys.executable, "--export-job", spec_path]
+        else:
+            cmd = [sys.executable, "-m", "wx4app.job_runner", spec_path]
+        flags = 0x08000000 if os.name == "nt" else 0  # CREATE_NO_WINDOW
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL, creationflags=flags)
+        self._timer.start()
+
+    def _drain(self):
+        if not self._prog_path:
+            return
+        try:
+            with open(self._prog_path, encoding="utf-8") as fh:
+                fh.seek(self._pos)
+                chunk = fh.read()
+                self._pos = fh.tell()
+        except OSError:
+            return
+        if not chunk:
+            return
+        self._buf += chunk
+        *lines, self._buf = self._buf.split("\n")
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue
+            if "p" in msg:
+                self.progress_text.emit(int(msg.get("p") or 0),
+                                        int(msg.get("t") or 0),
+                                        str(msg.get("label") or ""))
+            elif msg.get("ok") is True:
+                self._result = msg.get("result") or {}
+            elif msg.get("ok") is False:
+                self._error = str(msg.get("error") or "导出失败")
+
+    def _poll(self):
+        self._drain()
+        if self.proc is None or self.proc.poll() is None:
+            return
+        self._drain()
+        self._timer.stop()
+        code = self.proc.returncode
+        if self._cancelled:
+            self.done.emit({"cancelled": True})
+        elif self._error:
+            self.failed.emit(self._error)
+        elif self._result is None:
+            self.failed.emit(f"导出进程异常退出（退出码 {code}）")
+        else:
+            self.done.emit(self._result)
+        self._cleanup()
+
+    def _cleanup(self):
+        for path in (self._spec_path, self._prog_path):
+            if path:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+        self._spec_path = self._prog_path = None
 
     def stop(self):
-        self._stop = True
-
-    def run(self):
-        try:
-            res = self.source.export_all(
-                self.root, include_images=self.include_images,
-                progress=lambda i, t, n: self.progress.emit(i, t, n),
-                should_stop=lambda: self._stop,
-                start_ts=self.start_ts, end_ts=self.end_ts, layout=self.layout,
-                include_files=self.include_files)
-            self.done.emit(res)
-        except Exception as exc:  # noqa: BLE001
-            self.failed.emit(f"{type(exc).__name__}: {exc}")
+        self._cancelled = True
+        if self.proc is not None and self.proc.poll() is None:
+            try:
+                self.proc.terminate()
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------- 兜底数据源
@@ -235,7 +306,7 @@ class MainWindow(RoundedMainWindow):
         self._msg_timer.setInterval(260)
         self._msg_timer.timeout.connect(self._apply_msg_filter)
         self._cancel_fn = None
-        self._msg_workers: list[QThread] = []
+        self._msg_workers: list[threading.Thread] = []
         self._load_gen = 0
         self.setWindowIcon(logo_icon())
 
@@ -249,17 +320,18 @@ class MainWindow(RoundedMainWindow):
             self.chat._img_timer.stop()
         except (AttributeError, RuntimeError):
             pass
+        for attr in ("_export_job", "_export_all_job"):
+            job = getattr(self, attr, None)
+            if job is not None:
+                job.stop()
         workers = list(getattr(self, "_msg_workers", []))
-        for attr in ("_export_worker", "_export_all_worker", "_init_worker"):
+        for attr in ("_init_worker",):
             w = getattr(self, attr, None)
             if w is not None:
                 workers.append(w)
         for w in workers:
-            if w.isRunning():
-                try:
-                    w.wait(5000)
-                except RuntimeError:
-                    pass
+            if w.is_alive():
+                w.join(5.0)
 
     # ---------------- UI ----------------
     def _build_ui(self):
@@ -554,8 +626,8 @@ class MainWindow(RoundedMainWindow):
             else:
                 QMessageBox.critical(self, "无法读取微信数据", msg)
 
-        self._init_worker.ready.connect(ok)
-        self._init_worker.failed.connect(bad)
+        self._init_worker.signals.ready.connect(ok, Qt.QueuedConnection)
+        self._init_worker.signals.failed.connect(bad, Qt.QueuedConnection)
         self._init_worker.start()
 
     def _apply_source(self, source):
@@ -655,9 +727,12 @@ class MainWindow(RoundedMainWindow):
         self.tab_chat.setChecked(key == "chat")
         self.tab_images.setChecked(key == "images")
         self.stack.setCurrentIndex(0 if key == "chat" else 1)
-        if key == "images" and self.current:
-            self.images.load(self._image_list(),
-                             lambda m: image_path_of(self.source, self.current["id"], m))
+        if key == "images":
+            self.chat.pause_images()      # 让出解码资源给图片墙
+            if self.current:
+                self._reset_images()
+        else:
+            self.chat.resume_images()
 
     # ---------------- 会话 ----------------
     def _on_conv_changed(self, row: int):
@@ -684,9 +759,17 @@ class MainWindow(RoundedMainWindow):
         w = MessagesWorker(self.source, cid, limit=150)
         # 用列表持有线程：如果直接覆盖引用，上一个还在跑的 QThread 会被销毁导致崩溃
         self._msg_workers.append(w)
-        w.done.connect(lambda cid_, d, g=gen: self._on_messages_ready(cid_, d, g))
-        w.failed.connect(lambda cid_, m, g=gen: self._on_messages_failed(cid_, m, g))
-        w.finished.connect(lambda: self._msg_workers.remove(w) if w in self._msg_workers else None)
+        w.signals.done.connect(
+            lambda payload, g=gen: self._on_messages_ready(
+                payload.get("cid", ""), payload.get("data") or {}, g),
+            Qt.QueuedConnection)
+        w.signals.failed.connect(
+            lambda payload, g=gen: self._on_messages_failed(
+                payload.get("cid", ""), payload.get("error", ""), g),
+            Qt.QueuedConnection)
+        w.signals.finished.connect(
+            lambda: self._msg_workers.remove(w) if w in self._msg_workers else None,
+            Qt.QueuedConnection)
         w.start()
 
     def _show_loading(self, text: str):
@@ -736,8 +819,7 @@ class MainWindow(RoundedMainWindow):
         self.type_filter = "all"
         self._render_chat(keep_bottom=True)
         if self.tab == "images":
-            self.images.load(self._image_list(),
-                             lambda m: image_path_of(self.source, self.current["id"], m))
+            self._reset_images()
 
     def _render_chat(self, keep_bottom=True):
         kw = self.msg_filter.text().strip().lower()
@@ -777,22 +859,24 @@ class MainWindow(RoundedMainWindow):
         self._render_chat(keep_bottom=False)
 
     # ---------------- 图片 ----------------
-    def _image_list(self) -> list[dict]:
+    def _reset_images(self):
         if not self.current:
-            return []
-        try:
-            return self.source.images(self.current["id"])
-        except Exception:  # noqa: BLE001
-            return []
+            return
+        cid = self.current["id"]
+        self.images.reset(
+            lambda before=None: self.source.images_page(cid, before),
+            lambda m: image_path_of(self.source, cid, m))
 
     def _open_lightbox_for_msg(self, msg: dict):
-        imgs = self._image_list() or [msg]
+        imgs = self.images.items or [msg]
         idx = next((i for i, m in enumerate(imgs) if m.get("src") == msg.get("src")), 0)
         Lightbox(imgs, idx,
                  lambda m: image_path_of(self.source, self.current["id"], m), self).exec()
 
     def _open_lightbox(self, index: int):
-        imgs = self._image_list()
+        imgs = self.images.items
+        if not imgs:
+            return
         Lightbox(imgs, index,
                  lambda m: image_path_of(self.source, self.current["id"], m), self).exec()
 
@@ -877,42 +961,22 @@ class MainWindow(RoundedMainWindow):
         do_img, do_chat, do_file = opt["do_images"], opt["do_chat"], opt["do_files"]
         st, et, layout = opt["start_ts"], opt["end_ts"], opt["layout"]
 
-        def fn(cb):
-            res = {"count": 0, "images": 0, "files": 0,
-                   "dir": str(self.export_root), "cancelled": False}
-            if do_img:
-                r = self.source.export_images(
-                    cid, self.export_root, progress=cb,
-                    should_stop=lambda: self._stop_flag,
-                    start_ts=st, end_ts=et, layout=layout)
-                res.update(r)
-                res["images"] = r.get("count", 0)
-                if r.get("cancelled"):
-                    return res
-            if do_file:
-                fr = self.source.export_files(
-                    cid, self.export_root, progress=cb,
-                    should_stop=lambda: self._stop_flag,
-                    start_ts=st, end_ts=et, layout=layout)
-                res["files"] = fr.get("count", 0)
-                res["missing_files"] = fr.get("missing", 0)
-                res["file_map"] = fr.get("files") or {}
-                if fr.get("cancelled"):
-                    return res
-            if do_chat:
-                c = self.source.export_chat(
-                    cid, self.export_root, st, et,
-                    images_map=(res.get("files") or {}) if do_img else {},
-                    files_map=(res.get("file_map") or {}) if do_file else {})
-                res["count"] = c.get("count", 0)
-                res["dir"] = c.get("dir", res["dir"])
-            return res
-
-        w = ExportWorker(fn)
-        self._export_worker = w
-        if do_img:
-            w.progress.connect(lambda i, t: self._update_progress(
-                i, t, f"正在导出「{name}」的图片：{i}/{t}"))
+        spec = {
+            "kind": "chat",
+            "account": str(self.source.account),
+            "cid": cid,
+            "out_root": str(self.export_root),
+            "start_ts": st, "end_ts": et, "layout": layout,
+            "do_images": do_img, "do_files": do_file, "do_chat": do_chat,
+        }
+        w = ExportJob(spec)
+        self._export_job = w
+        self._cancel_fn = w.stop
+        if do_img or do_file:
+            w.progress_text.connect(
+                lambda i, t, label: self._update_progress(
+                    i, t, f"正在导出{label or '内容'}：{i}/{t}"),
+                Qt.QueuedConnection)
 
         def done(res: dict):
             self._hide_progress()
@@ -944,8 +1008,8 @@ class MainWindow(RoundedMainWindow):
             btn.setText(btn_text)
             QMessageBox.critical(self, "导出失败", msg)
 
-        w.done.connect(done)
-        w.failed.connect(failed)
+        w.done.connect(done, Qt.QueuedConnection)
+        w.failed.connect(failed, Qt.QueuedConnection)
         w.start()
 
     def _export_all(self):
@@ -968,13 +1032,20 @@ class MainWindow(RoundedMainWindow):
 
         self._stop_flag = False
         self._show_progress("正在导出全部会话…")
-        worker = ExportAllWorker(self.source, self.export_root, opt["do_images"],
-                                 opt["start_ts"], opt["end_ts"], opt["layout"],
-                                 opt["do_files"])
-        self._export_all_worker = worker
+        spec = {
+            "kind": "all",
+            "account": str(self.source.account),
+            "out_root": str(self.export_root),
+            "start_ts": opt["start_ts"], "end_ts": opt["end_ts"],
+            "layout": opt["layout"],
+            "do_images": opt["do_images"], "do_files": opt["do_files"],
+        }
+        worker = ExportJob(spec)
+        self._export_all_job = worker
         self._cancel_fn = worker.stop
-        worker.progress.connect(
-            lambda i, t, n: self._update_progress(i, t, f"正在导出（{i}/{t}）：{n}"))
+        worker.progress_text.connect(
+            lambda i, t, n: self._update_progress(i, t, f"正在导出（{i}/{t}）：{n}"),
+            Qt.QueuedConnection)
 
         def on_done(res: dict):
             self._hide_progress()
@@ -994,6 +1065,6 @@ class MainWindow(RoundedMainWindow):
             self._hide_progress()
             QMessageBox.critical(self, "导出失败", msg)
 
-        worker.done.connect(on_done)
-        worker.failed.connect(on_failed)
+        worker.done.connect(on_done, Qt.QueuedConnection)
+        worker.failed.connect(on_failed, Qt.QueuedConnection)
         worker.start()

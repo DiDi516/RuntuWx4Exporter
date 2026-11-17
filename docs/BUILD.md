@@ -25,7 +25,7 @@ $assets = (Resolve-Path .\wx4app\assets).Path
   --hidden-import wx4app.window --hidden-import wx4app.widgets `
   --hidden-import wx4app.setup --hidden-import wx4app.theme `
   --hidden-import wx4app.config --hidden-import wx4app.assets `
-  --hidden-import wx4app.export_dialog --hidden-import wx4app.frameless `
+  --hidden-import wx4app.export_dialog --hidden-import wx4app.frameless --hidden-import wx4app.job_runner `
   --hidden-import wx4view.live --hidden-import wx4export.core `
   --hidden-import wxmanager.wx4 --hidden-import wxmanager.wx4keys `
   --hidden-import Crypto.Cipher.AES --hidden-import zstandard `
