@@ -6,7 +6,10 @@ from pathlib import Path
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import QGraphicsDropShadowEffect, QWidget
 
-CHECK_ICON = (Path(__file__).resolve().parent / "assets" / "check.png").as_posix()
+ASSETS = Path(__file__).resolve().parent / "assets"
+CHECK_ICON = (ASSETS / "check.png").as_posix()
+ARROW_UP = (ASSETS / "arrow_up.png").as_posix()
+ARROW_DOWN = (ASSETS / "arrow_down.png").as_posix()
 
 PRIMARY = "#409EFF"
 PRIMARY_HOVER = "#66B1FF"
@@ -147,6 +150,22 @@ QComboBox QAbstractItemView {{
     selection-background-color: {PRIMARY_LIGHT}; selection-color: {PRIMARY};
     outline: none; padding: 4px;
 }}
+
+/* ---------- 数字输入框 ---------- */
+QSpinBox {{
+    background: {WHITE}; border: 1px solid {BORDER}; border-radius: 8px;
+    padding: 5px 8px; color: {TEXT_PRIMARY};
+}}
+QSpinBox:hover {{ border-color: #C0C4CC; }}
+QSpinBox:focus {{ border-color: {PRIMARY}; }}
+QSpinBox::up-button, QSpinBox::down-button {{
+    subcontrol-origin: border; width: 20px; border: none; background: transparent;
+}}
+QSpinBox::up-button {{ subcontrol-position: top right; margin: 4px 4px 0 0; border-radius: 4px; }}
+QSpinBox::down-button {{ subcontrol-position: bottom right; margin: 0 4px 4px 0; border-radius: 4px; }}
+QSpinBox::up-button:hover, QSpinBox::down-button:hover {{ background: {PRIMARY_LIGHT}; }}
+QSpinBox::up-arrow {{ image: url("{ARROW_UP}"); width: 9px; height: 9px; }}
+QSpinBox::down-arrow {{ image: url("{ARROW_DOWN}"); width: 9px; height: 9px; }}
 
 /* ---------- 滚动条 ---------- */
 QScrollBar:vertical {{ background: transparent; width: 8px; margin: 2px; }}

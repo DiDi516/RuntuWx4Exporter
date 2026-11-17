@@ -608,7 +608,7 @@ class LiveSource:
     def export_all(self, out_root: Path, include_images: bool = True,
                    progress=None, should_stop=None, limit_sessions: int = 0,
                    start_ts: int = 0, end_ts: int = 0, layout: str = "date",
-                   include_files: bool = False) -> dict:
+                   include_files: bool = False, html_split: bool | None = None) -> dict:
         """导出全部会话（记录 + 可选图片），并打包成一个 zip。"""
         import time
         import zipfile
@@ -648,7 +648,8 @@ class LiveSource:
                     files += fr.get("count", 0)
                     file_map = fr.get("files") or {}
                 self.export_chat(s["id"], work, start_ts=start_ts, end_ts=end_ts,
-                                 images_map=img_map, files_map=file_map)
+                                 images_map=img_map, files_map=file_map,
+                                 split_html=html_split)
                 done += 1
             except Exception:  # noqa: BLE001
                 skipped += 1
@@ -671,9 +672,11 @@ class LiveSource:
                 "dir": str(work), "zip": str(zip_path), "size": size,
                 "cancelled": bool(should_stop and should_stop())}
 
+    SPLIT_THRESHOLD = 1500   # 超过这么多条就默认按月拆页，避免浏览器卡死
+
     def export_chat(self, username: str, out_root: Path, start_ts: int = 0,
                     end_ts: int = 0, images_map: dict | None = None,
-                    files_map: dict | None = None) -> dict:
+                    files_map: dict | None = None, split_html: bool | None = None) -> dict:
         msgs: list[dict] = []
         for page_rows in self._iter_rows(username, start_ts=start_ts, end_ts=end_ts):
             msgs = self._parse_rows(page_rows, username) + msgs
@@ -693,8 +696,29 @@ class LiveSource:
             lines.append(f"[{m['t'][11:]}] {m['who']}: {m['text']}")
 
         (base_dir / "聊天记录.txt").write_text("\n".join(lines), encoding="utf-8")
-        (base_dir / "聊天记录.html").write_text(
-            self._chat_html(name, msgs, images_map or {}, files_map or {}), encoding="utf-8")
+
+        # HTML：大会话按月拆分成多个小页面 + 索引页（单页几万节点会让浏览器卡死）
+        do_split = (len(msgs) > self.SPLIT_THRESHOLD) if split_html is None else split_html
+        if do_split and msgs:
+            groups: list[tuple[str, list[dict]]] = []
+            for m in msgs:
+                month = m["t"][:7]
+                if not groups or groups[-1][0] != month:
+                    groups.append((month, []))
+                groups[-1][1].append(m)
+            page_dir = base_dir / "聊天记录"
+            page_dir.mkdir(exist_ok=True)
+            for month, part in groups:
+                (page_dir / f"{month}.html").write_text(
+                    self._chat_html(name, part, images_map or {}, files_map or {},
+                                    back_href="../聊天记录.html"), encoding="utf-8")
+            (base_dir / "聊天记录.html").write_text(
+                self._chat_index_html(name, list(reversed(groups)), len(msgs)),
+                encoding="utf-8")
+        else:
+            (base_dir / "聊天记录.html").write_text(
+                self._chat_html(name, msgs, images_map or {}, files_map or {}),
+                encoding="utf-8")
 
         records = [{k: v for k, v in m.items() if not k.startswith("_")} for m in msgs]
         n_img = sum(1 for m in msgs if m.get("_md5"))
@@ -708,6 +732,41 @@ class LiveSource:
             "messages": records,
         }, ensure_ascii=False), encoding="utf-8")
         return {"dir": str(base_dir), "count": len(records), "images": n_img}
+
+    def _chat_index_html(self, name: str, groups: list[tuple[str, list[dict]]],
+                         total: int) -> str:
+        """按月索引页：先把月份列出来，避免一次性渲染整段历史。"""
+        rows = []
+        for month, msgs in groups:
+            first, last = msgs[0]["t"][:10], msgs[-1]["t"][:10]
+            rows.append(
+                f'<a class="month" href="聊天记录/{month}.html">'
+                f'<b>{month}</b><span>{len(msgs)} 条</span>'
+                f'<i>{first} ~ {last}</i></a>')
+        return f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>与 {html_mod.escape(name)} 的聊天记录</title>
+<style>
+body{{margin:0;background:#F5F7FA;font:14px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif;color:#303133}}
+.wrap{{max-width:720px;margin:0 auto;padding:28px 16px 48px}}
+h1{{font-size:17px;font-weight:600;text-align:center;margin:6px 0 4px}}
+.sub{{text-align:center;color:#909399;font-size:12px;margin-bottom:18px}}
+.tip{{text-align:center;color:#C0C4CC;font-size:12px;margin:16px 0 8px}}
+.months{{display:flex;flex-direction:column;gap:8px}}
+.month{{display:flex;align-items:center;gap:12px;padding:12px 16px;background:#fff;
+  border:1px solid #EBEEF5;border-radius:10px;text-decoration:none;color:#303133}}
+.month:hover{{border-color:#B3D8FF;background:#F7FBFF}}
+.month b{{font-weight:600;font-size:14px;min-width:88px}}
+.month span{{color:#409EFF;font-size:12px;background:#ECF5FF;border-radius:8px;padding:1px 8px}}
+.month i{{margin-left:auto;color:#909399;font-size:12px;font-style:normal}}
+</style></head><body><div class="wrap">
+<h1>与 {html_mod.escape(name)} 的聊天记录</h1>
+<div class="sub">共 {total} 条消息 · 按月拆分（点击月份查看）</div>
+<div class="months">
+{"".join(rows)}
+</div>
+<div class="tip">由「闰土微信记录导出器」导出 · 仅本地查看</div>
+</div></body></html>"""
 
     # ---------------- HTML（带头像 / 图片 / 语音） ----------------
     def _avatar_uri(self, uid: str) -> str:
@@ -728,7 +787,7 @@ class LiveSource:
         return cache[uid]
 
     def _chat_html(self, name: str, msgs: list[dict], images_map: dict,
-                   files_map: dict | None = None) -> str:
+                   files_map: dict | None = None, back_href: str = "") -> str:
         files_map = files_map or {}
         speakers = {m.get("who") for m in msgs} - {"我", "系统", name, ""}
         is_group = bool(speakers)
@@ -810,11 +869,15 @@ class LiveSource:
 <title>与 {html_mod.escape(name)} 的聊天记录</title>
 <style>
 body{{margin:0;background:#F5F7FA;font:14px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif;color:#303133}}
+.back{{max-width:840px;margin:14px auto -6px;padding:0 16px;font-size:12px}}
+.back a{{color:#409EFF;text-decoration:none}}
+.back a:hover{{text-decoration:underline}}
 .wrap{{max-width:840px;margin:0 auto;padding:18px 16px 40px}}
 h1{{font-size:16px;font-weight:600;text-align:center;margin:8px 0 4px}}
 .sub{{text-align:center;color:#909399;font-size:12px;margin-bottom:14px}}
 .day{{text-align:center;color:#909399;font-size:12px;margin:18px 0 8px}}
-.row{{display:flex;gap:10px;margin:12px 0;align-items:flex-start}}
+.row{{display:flex;gap:10px;margin:12px 0;align-items:flex-start;
+  content-visibility:auto;contain-intrinsic-size:auto 72px}}
 .row.me{{flex-direction:row-reverse}}
 .ava{{width:34px;height:34px;border-radius:9px;flex:none;color:#fff;font-size:14px;
   background-size:cover;background-position:center;display:flex;align-items:center;justify-content:center}}
@@ -842,6 +905,7 @@ h1{{font-size:16px;font-weight:600;text-align:center;margin:8px 0 4px}}
 .stat{{text-align:center;color:#C0C4CC;font-size:12px;margin-top:22px}}
 {classes}
 </style></head><body><div class="wrap">
+{"<div class='back'><a href='" + back_href + "'>← 返回按月索引</a></div>" if back_href else ""}
 <h1>与 {html_mod.escape(name)} 的聊天记录</h1>
 <div class="sub">共 {len(msgs)} 条消息 · 导出时间 {datetime.now():%Y-%m-%d %H:%M}</div>
 {"".join(rows)}

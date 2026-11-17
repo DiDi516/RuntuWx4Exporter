@@ -76,7 +76,8 @@ def main(argv: list[str] | None = None) -> int:
                 res["missing_files"] = r.get("missing", 0)
             if spec.get("do_chat"):
                 c = src.export_chat(cid, out, start_ts, end_ts,
-                                    images_map=img_map, files_map=file_map)
+                                    images_map=img_map, files_map=file_map,
+                                    split_html=bool(spec.get("html_split", True)))
                 res["count"] = c.get("count", 0)
                 res["dir"] = c.get("dir", res["dir"])
             _emit({"ok": True, "result": res})
@@ -88,6 +89,7 @@ def main(argv: list[str] | None = None) -> int:
             include_images=bool(spec.get("do_images")),
             include_files=bool(spec.get("do_files")),
             start_ts=start_ts, end_ts=end_ts, layout=layout,
+            html_split=bool(spec.get("html_split", True)),
             progress=lambda i, t, name: progress(i, t, name))
         r.pop("files", None) if not isinstance(r.get("files"), int) else None
         _emit({"ok": True, "result": r})

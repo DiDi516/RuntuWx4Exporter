@@ -1,43 +1,158 @@
-"""本地配置：记住微信账号目录与导出目录。"""
+"""应用配置：本地 config.ini（应用目录下）。
+
+结构：
+    [general]  account_dir / workspace / export_dir / export_layout
+    [logging]  enabled / dir / retention_days / level
+
+日志与工作空间默认都放在应用目录下（便携式），目录不可写时回退到
+%LOCALAPPDATA%\\wx4app。旧版本的 config.json 会自动迁移一次。
+"""
 from __future__ import annotations
 
+import configparser
 import json
 import os
+import sys
 from pathlib import Path
 
-CFG_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "wx4app"
-CFG_FILE = CFG_DIR / "config.json"
+APP_NAME_DIR = "wx4app"
 
-DEFAULTS = {"account_dir": "", "export_dir": ""}
+DEFAULTS: dict = {
+    "account_dir": "",
+    "workspace": "",
+    "export_dir": "",
+    "export_layout": "date",
+    "log_enabled": True,
+    "log_dir": "",
+    "log_retention": 30,
+    "log_level": "INFO",
+}
+
+LOG_LEVELS = ["DEBUG", "INFO", "WARNING", "ERROR"]
+
+
+# ---------------------------------------------------------------- 路径
+def app_dir() -> Path:
+    """应用所在目录（打包后是 exe 同级目录，开发时是项目根目录）。"""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent.parent
+
+
+def _fallback_dir(kind: str) -> Path:
+    base = Path(os.environ.get("LOCALAPPDATA", Path.home())) / APP_NAME_DIR
+    return base / kind if kind else base
+
+
+def _writable(path: Path, fallback: Path) -> Path:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        probe = path / ".write_test"
+        probe.write_text("1", encoding="utf-8")
+        probe.unlink()
+        return path
+    except OSError:
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
+
+
+def default_workspace_dir() -> str:
+    return str(_writable(app_dir() / "workspace", _fallback_dir("workspace")))
+
+
+def default_logs_dir() -> str:
+    return str(_writable(app_dir() / "logs", _fallback_dir("logs")))
+
+
+def config_file() -> Path:
+    target = app_dir() / "config.ini"
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        return target
+    except OSError:
+        base = _fallback_dir("")
+        base.mkdir(parents=True, exist_ok=True)
+        return base / "config.ini"
+
+
+# ---------------------------------------------------------------- 读写
+def _legacy_json() -> dict:
+    """旧版配置（%LOCALAPPDATA%\\wx4app\\config.json）迁移用。"""
+    path = Path(os.environ.get("LOCALAPPDATA", Path.home())) / APP_NAME_DIR / "config.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
 
 
 def load() -> dict:
     cfg = dict(DEFAULTS)
-    try:
-        cfg.update(json.loads(CFG_FILE.read_text(encoding="utf-8")))
-    except (OSError, ValueError):
-        pass
+    path = config_file()
+    if path.exists():
+        parser = configparser.ConfigParser()
+        try:
+            parser.read(path, encoding="utf-8")
+        except (OSError, configparser.Error):
+            pass
+        if parser.has_section("general"):
+            g = parser["general"]
+            cfg["account_dir"] = g.get("account_dir", "").strip()
+            cfg["workspace"] = g.get("workspace", "").strip()
+            cfg["export_dir"] = g.get("export_dir", "").strip()
+            cfg["export_layout"] = g.get("export_layout", "date").strip() or "date"
+        if parser.has_section("logging"):
+            lg = parser["logging"]
+            cfg["log_enabled"] = lg.getboolean("enabled", True)
+            cfg["log_dir"] = lg.get("dir", "").strip()
+            try:
+                cfg["log_retention"] = max(1, lg.getint("retention_days", 30))
+            except ValueError:
+                cfg["log_retention"] = 30
+            level = lg.get("level", "INFO").strip().upper()
+            cfg["log_level"] = level if level in LOG_LEVELS else "INFO"
+    else:
+        legacy = _legacy_json()
+        if legacy:
+            # 只迁移账号目录与导出布局；导出目录统一由工作空间决定
+            cfg["account_dir"] = legacy.get("account_dir", "") or ""
+            cfg["export_layout"] = legacy.get("export_layout", "date") or "date"
+
+    if not cfg["workspace"]:
+        cfg["workspace"] = default_workspace_dir()
+    if not cfg["export_dir"]:
+        cfg["export_dir"] = cfg["workspace"]
+    if not cfg["log_dir"]:
+        cfg["log_dir"] = default_logs_dir()
     return cfg
 
 
 def save(**kw) -> None:
     cfg = load()
     cfg.update({k: v for k, v in kw.items() if v is not None})
-    CFG_DIR.mkdir(parents=True, exist_ok=True)
-    CFG_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
+
+    parser = configparser.ConfigParser()
+    parser["general"] = {
+        "account_dir": str(cfg.get("account_dir") or ""),
+        "workspace": str(cfg.get("workspace") or ""),
+        "export_dir": str(cfg.get("export_dir") or ""),
+        "export_layout": str(cfg.get("export_layout") or "date"),
+    }
+    parser["logging"] = {
+        "enabled": "true" if cfg.get("log_enabled", True) else "false",
+        "dir": str(cfg.get("log_dir") or ""),
+        "retention_days": str(int(cfg.get("log_retention") or 30)),
+        "level": str(cfg.get("log_level") or "INFO"),
+    }
+    with open(config_file(), "w", encoding="utf-8") as fh:
+        parser.write(fh)
 
 
 def default_export_dir() -> str:
-    cfg = load()
-    if cfg.get("export_dir"):
-        return cfg["export_dir"]
-    cwd = Path.cwd()
-    for cand in (cwd / "微信导出", cwd.parent / "微信导出"):
-        if cand.is_dir():
-            return str(cand)
-    return str(Path.home() / "Documents" / "微信导出")
+    return load()["export_dir"]
 
 
+# ---------------------------------------------------------------- 账号目录
 def _freshness(acc: Path) -> float:
     """用消息库最后写入时间判断账号是否在用（比目录 mtime 可靠）。"""
     msgs = list((acc / "db_storage" / "message").glob("message_*.db"))
@@ -104,18 +219,5 @@ def detect_candidates() -> list[dict]:
 
 def detect_account() -> Path | None:
     """自动探测本机微信 4.x 账号目录。"""
-    roots: list[Path] = []
-    home = Path(os.environ.get("USERPROFILE", Path.home()))
-    roots.append(home / "Documents" / "xwechat_files")
-    for drive in ("C:", "D:", "E:", "F:"):
-        users = Path(drive + "/Users")
-        if users.exists():
-            for u in users.glob("*"):
-                roots.append(u / "Documents" / "xwechat_files")
-    found: list[Path] = []
-    for root in roots:
-        if root.is_dir():
-            found += [c for c in root.iterdir() if (c / "db_storage").is_dir()]
-    if not found:
-        return None
-    return max(found, key=_freshness)
+    cands = detect_candidates()
+    return Path(cands[0]["path"]) if cands else None

@@ -33,6 +33,12 @@ demo-out/
 keys.json
 config.json
 
+
+# ---------- 运行时产物（应用目录下） ----------
+config.ini
+logs/
+workspace/
+
 # ---------- 日志/临时 ----------
 *.log
 *.tmp

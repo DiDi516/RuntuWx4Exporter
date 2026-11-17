@@ -10,8 +10,7 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -36,11 +35,16 @@ from wx4view.live import LiveSource
 
 from . import config
 from .assets import APP_NAME, APP_VERSION, logo_icon, logo_pixmap
+from .dialogs import notify
 from .export_dialog import ExportDialog
 from .frameless import RoundedMainWindow, TitleBar
+from .logging_setup import get_logger, setup_logging
+from .settings_dialog import SettingsDialog
 from .setup import SetupDialog
 from .theme import QSS, add_shadow
 from .widgets import ChatView, ConvDelegate, ImagesView, Lightbox
+
+log = get_logger("window")
 
 TYPES = [("all", "全部类型"), ("text", "文本"), ("image", "图片"), ("file", "文件"),
          ("link", "链接"), ("voice", "语音"), ("sticker", "表情"), ("video", "视频"),
@@ -374,12 +378,19 @@ class MainWindow(RoundedMainWindow):
         bl.addLayout(tb)
         bl.addStretch(1)
 
-        self.btn_dir = QPushButton("目录设置")
+        self.btn_dir = QPushButton("连接微信数据")
         self.btn_dir.setObjectName("Plain")
         self.btn_dir.setCursor(Qt.PointingHandCursor)
         self.btn_dir.setMinimumHeight(32)
         self.btn_dir.clicked.connect(lambda: self._ask_setup(first=False))
         bl.addWidget(self.btn_dir)
+
+        self.btn_settings = QPushButton("设置")
+        self.btn_settings.setObjectName("Plain")
+        self.btn_settings.setCursor(Qt.PointingHandCursor)
+        self.btn_settings.setMinimumHeight(32)
+        self.btn_settings.clicked.connect(self._open_settings)
+        bl.addWidget(self.btn_settings)
 
         self.btn_all = QPushButton("一键导出全部")
         self.btn_all.setObjectName("Primary")
@@ -431,7 +442,7 @@ class MainWindow(RoundedMainWindow):
         self.conv_list.setMouseTracking(True)
         self.conv_list.setUniformItemSizes(True)
         self.conv_list.setItemDelegate(ConvDelegate(self.conv_list))
-        self.conv_list.currentRowChanged.connect(self._on_conv_changed)
+        self.conv_list.currentRowChanged.connect(self._safe_conv_changed)
         ll.addWidget(self.conv_list, 1)
 
         self.list_foot = QLabel("连接中…")
@@ -568,6 +579,22 @@ class MainWindow(RoundedMainWindow):
             b.clicked.connect(lambda _=False, k=key: self._set_filter(k))
         return b
 
+    # ---------------- 设置 ----------------
+    def _open_settings(self):
+        dlg = SettingsDialog(self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        cfg = config.load()
+        setup_logging(cfg)
+        self.export_root = Path(cfg["export_dir"])
+        self.export_root.mkdir(parents=True, exist_ok=True)
+        self.list_foot.setText(
+            f"共 {len(self.sessions)} 个会话 · 工作空间 {self.export_root}")
+        notify(self, "设置已保存",
+               f"配置文件：{config.config_file()}\n工作空间：{cfg['workspace']}\n"
+               f"日志目录：{cfg['log_dir']}（保留 {cfg['log_retention']} 天）",
+               str(config.config_file().parent), "⚙️")
+
     # ---------------- 启动 / 数据源 ----------------
     def _startup(self, account: str | None, files_only: bool):
         if files_only:
@@ -595,6 +622,7 @@ class MainWindow(RoundedMainWindow):
             return
         if dlg.remember and dlg.account_dir:
             config.save(account_dir=dlg.account_dir)
+            log.info("切换微信目录：%s", dlg.account_dir)
         self._load_live(dlg.account_dir)
 
     def _load_live(self, account: str | None, allow_auto_retry: bool = True):
@@ -638,6 +666,7 @@ class MainWindow(RoundedMainWindow):
         account = getattr(source, "account", None)
         name = account.name if account else self.export_root.name
         self.sub_label.setText(f"{mode} · {name}")
+        log.info("连接数据源：模式=%s 账号=%s 会话=%d", mode, name, len(self.sessions))
         self.setWindowTitle(f"{APP_NAME} — {mode}（{len(self.sessions)} 个会话）")
         self.list_foot.setText(
             f"共 {len(self.sessions)} 个会话 · 头像 {len(getattr(source, '_avatars', {}))} 个")
@@ -735,11 +764,21 @@ class MainWindow(RoundedMainWindow):
             self.chat.resume_images()
 
     # ---------------- 会话 ----------------
+    def _safe_conv_changed(self, row: int):
+        """Qt 槽里抛异常在部分版本会导致进程直接退出，这里兜住并记录。"""
+        try:
+            self._on_conv_changed(row)
+        except Exception:  # noqa: BLE001
+            import traceback
+            traceback.print_exc()
+
     def _on_conv_changed(self, row: int):
         if row < 0 or not self.source:
             return
         item = self.conv_list.item(row)
-        if not item or item.isHidden():
+        if item is None or item.isHidden():
+            return
+        if item.data(Qt.UserRole) is None:
             return
         cid = item.data(Qt.UserRole)
         conv = self._conv_index.get(cid)
@@ -754,6 +793,17 @@ class MainWindow(RoundedMainWindow):
             except Exception as exc:  # noqa: BLE001
                 QMessageBox.critical(self, "读取失败", str(exc))
             return
+        # 快速切换时限制并发线程数量，避免线程/连接堆积
+        self._msg_workers = [w for w in self._msg_workers if w.is_alive()]
+        running_same = any(getattr(w, "cid", None) == cid for w in self._msg_workers)
+        if running_same or len(self._msg_workers) >= 3:
+            try:
+                self._apply_messages(conv, self.source.messages(cid, limit=150))
+            except Exception as exc:  # noqa: BLE001
+                self._hide_loading()
+                QMessageBox.critical(self, "读取失败", str(exc))
+            return
+
         # 首次打开：后台解析，避免几万条消息把界面卡住
         self._show_loading(f"正在加载「{conv['name']}」…")
         w = MessagesWorker(self.source, cid, limit=150)
@@ -795,6 +845,7 @@ class MainWindow(RoundedMainWindow):
 
     def _apply_messages(self, conv: dict, data: dict):
         self.msgs = data.get("messages", [])
+        log.debug("打开会话：%s（%d 条）", data.get("name") or conv.get("name"), len(self.msgs))
         self.has_more = bool(data.get("has_more"))
         self.next_before = data.get("next_before") or 0
         self.is_group = bool(data.get("is_group"))
@@ -822,6 +873,8 @@ class MainWindow(RoundedMainWindow):
             self._reset_images()
 
     def _render_chat(self, keep_bottom=True):
+        if not self.current:      # 快速切换时可能已被清空
+            return
         kw = self.msg_filter.text().strip().lower()
         msgs = self.msgs
         if self.type_filter != "all":
@@ -874,6 +927,8 @@ class MainWindow(RoundedMainWindow):
                  lambda m: image_path_of(self.source, self.current["id"], m), self).exec()
 
     def _open_lightbox(self, index: int):
+        if not self.current:
+            return
         imgs = self.images.items
         if not imgs:
             return
@@ -887,6 +942,7 @@ class MainWindow(RoundedMainWindow):
             return False
         self.export_root = Path(d)
         config.save(export_dir=str(self.export_root))
+        log.info("导出目录设为：%s", self.export_root)
         return True
 
     def _show_progress(self, text: str):
@@ -920,15 +976,8 @@ class MainWindow(RoundedMainWindow):
         self.prog_cancel.setEnabled(False)
 
     def _notify_done(self, text: str, folder: str):
-        """导出完成提示：可直接打开目录。"""
-        box = QMessageBox(self)
-        box.setWindowTitle("导出完成")
-        box.setText(text)
-        open_btn = box.addButton("打开目录", QMessageBox.AcceptRole)
-        box.addButton("关闭", QMessageBox.RejectRole)
-        box.exec()
-        if box.clickedButton() is open_btn and folder:
-            QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
+        """导出完成提示（圆角风格，与应用一致），可直接打开目录。"""
+        notify(self, "导出完成", text, folder, "✅")
 
     def _export(self, what: str):
         if not self.current:
@@ -959,6 +1008,9 @@ class MainWindow(RoundedMainWindow):
         self._show_progress(f"正在导出「{name}」…")
 
         do_img, do_chat, do_file = opt["do_images"], opt["do_chat"], opt["do_files"]
+        log.info("开始导出：会话=%s 记录=%s 图片=%s 文件=%s 目录=%s 拆分HTML=%s",
+                 name, do_chat, do_img, do_file, self.export_root,
+                 opt.get("html_split", True))
         st, et, layout = opt["start_ts"], opt["end_ts"], opt["layout"]
 
         spec = {
@@ -968,6 +1020,7 @@ class MainWindow(RoundedMainWindow):
             "out_root": str(self.export_root),
             "start_ts": st, "end_ts": et, "layout": layout,
             "do_images": do_img, "do_files": do_file, "do_chat": do_chat,
+            "html_split": opt.get("html_split", True),
         }
         w = ExportJob(spec)
         self._export_job = w
@@ -983,8 +1036,8 @@ class MainWindow(RoundedMainWindow):
             btn.setEnabled(True)
             btn.setText(btn_text)
             if res.get("cancelled"):
-                QMessageBox.information(self, "已取消",
-                                        f"已导出 {res.get('images', 0)} 张图片\n{res.get('dir', '')}")
+                notify(self, "已取消", f"已导出 {res.get('images', 0)} 张图片",
+                       res.get("dir", ""), "⏹️")
                 return
             parts = []
             if do_chat:
@@ -999,14 +1052,16 @@ class MainWindow(RoundedMainWindow):
             rng = ""
             if st and et:
                 rng = f"\n时间范围：{datetime.fromtimestamp(st):%Y-%m-%d} ~ {datetime.fromtimestamp(et):%Y-%m-%d}"
+            log.info("导出完成：会话=%s 结果=%s 目录=%s", name, res, res.get("dir", ""))
             self._notify_done("、".join(parts) + rng + f"\n{res.get('dir', '')}",
                               res.get("dir", str(self.export_root)))
 
         def failed(msg: str):
+            log.error("导出失败：会话=%s 错误=%s", name, msg)
             self._hide_progress()
             btn.setEnabled(True)
             btn.setText(btn_text)
-            QMessageBox.critical(self, "导出失败", msg)
+            notify(self, "导出失败", msg, "", "⚠️")
 
         w.done.connect(done, Qt.QueuedConnection)
         w.failed.connect(failed, Qt.QueuedConnection)
@@ -1031,6 +1086,8 @@ class MainWindow(RoundedMainWindow):
             return
 
         self._stop_flag = False
+        log.info("开始导出全部：会话数=%d 含图片=%s 含文件=%s 目录=%s",
+                 len(self.sessions), opt["do_images"], opt["do_files"], self.export_root)
         self._show_progress("正在导出全部会话…")
         spec = {
             "kind": "all",
@@ -1039,6 +1096,7 @@ class MainWindow(RoundedMainWindow):
             "start_ts": opt["start_ts"], "end_ts": opt["end_ts"],
             "layout": opt["layout"],
             "do_images": opt["do_images"], "do_files": opt["do_files"],
+            "html_split": opt.get("html_split", True),
         }
         worker = ExportJob(spec)
         self._export_all_job = worker
@@ -1050,10 +1108,10 @@ class MainWindow(RoundedMainWindow):
         def on_done(res: dict):
             self._hide_progress()
             if res.get("cancelled"):
-                QMessageBox.information(
-                    self, "已取消",
-                    f"已导出部分会话：{res.get('sessions', 0)} 个\n{res.get('dir', '')}")
+                notify(self, "已取消", f"已导出部分会话：{res.get('sessions', 0)} 个",
+                       res.get("dir", ""), "⏹️")
                 return
+            log.info("导出全部完成：%s", res)
             size_mb = res.get("size", 0) / 1024 / 1024
             self._notify_done(
                 f"会话：{res.get('sessions', 0)} 个\n图片：{res.get('images', 0)} 张\n"
@@ -1062,8 +1120,9 @@ class MainWindow(RoundedMainWindow):
                 res.get("dir") or str(self.export_root))
 
         def on_failed(msg: str):
+            log.error("导出全部失败：%s", msg)
             self._hide_progress()
-            QMessageBox.critical(self, "导出失败", msg)
+            notify(self, "导出失败", msg, "", "⚠️")
 
         worker.done.connect(on_done, Qt.QueuedConnection)
         worker.failed.connect(on_failed, Qt.QueuedConnection)

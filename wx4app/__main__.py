@@ -3,6 +3,38 @@ from __future__ import annotations
 
 import argparse
 import sys
+import traceback
+from datetime import datetime
+from pathlib import Path
+
+_LOG_HANDLE = None
+
+
+def _enable_crash_log() -> None:
+    """把段错误/未捕获异常写到 %LOCALAPPDATA%\\wx4app\\crash.log，便于定位崩溃。"""
+    global _LOG_HANDLE
+    try:
+        import faulthandler
+
+        from . import config
+
+        base = Path(config.default_logs_dir())
+        base.mkdir(parents=True, exist_ok=True)
+        _LOG_HANDLE = open(base / "crash.log", "a", encoding="utf-8", buffering=1)
+        _LOG_HANDLE.write(f"\n===== {datetime.now():%Y-%m-%d %H:%M:%S} 启动 =====\n")
+        faulthandler.enable(file=_LOG_HANDLE, all_threads=True)
+    except Exception:  # noqa: BLE001
+        pass
+
+    def hook(exc_type, exc, tb):
+        try:
+            if _LOG_HANDLE:
+                _LOG_HANDLE.write("".join(traceback.format_exception(exc_type, exc, tb)))
+        except Exception:  # noqa: BLE001
+            pass
+        sys.__excepthook__(exc_type, exc, tb)
+
+    sys.excepthook = hook
 
 
 def _default_export_dir() -> str:
@@ -16,6 +48,14 @@ def main(argv: list[str] | None = None) -> int:
     if len(argv) >= 2 and argv[0] == "--export-job":
         from .job_runner import main as run_job
         return run_job([argv[1]])
+
+    _enable_crash_log()
+    from . import config as _cfg
+    from .logging_setup import get_logger, setup_logging
+
+    _log_path = setup_logging(_cfg.load())
+    _log = get_logger("app")
+    _log.info("应用启动（日志：%s）", _log_path or "已关闭")
 
     ap = argparse.ArgumentParser(prog="wx4app", description="微信聊天记录桌面版（PySide6）")
     ap.add_argument("--account", help="微信账号目录（默认自动探测）")

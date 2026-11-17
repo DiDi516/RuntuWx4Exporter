@@ -99,6 +99,12 @@ class ExportDialog(RoundedDialog):
             root.addWidget(self.cb_file)
 
         # 图片目录结构
+        # 聊天记录 HTML：按月拆分（默认开）
+        root.addWidget(self._section("聊天记录 HTML"))
+        self.cb_split = QCheckBox("按月拆分成多个小页面（大会话推荐，避免浏览器卡死）")
+        self.cb_split.setChecked(True)
+        root.addWidget(self.cb_split)
+
         root.addWidget(self._section("图片 / 文件 目录结构"))
         self.rb_date = QRadioButton("按日期分层：图片(文件)/2026/11/16/xxx")
         self.rb_flat = QRadioButton("平铺到同一目录：图片(文件)/xxx（图片名带日期时间）")
@@ -192,5 +198,6 @@ class ExportDialog(RoundedDialog):
             "do_images": self.cb_img.isChecked(),
             "do_files": self.cb_file.isChecked(),
             "layout": "flat" if self.rb_flat.isChecked() else "date",
+            "html_split": self.cb_split.isChecked(),
             "preset": days,
         }

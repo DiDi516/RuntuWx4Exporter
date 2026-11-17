@@ -1,6 +1,6 @@
 [project]
 name = "runtu-wx4-exporter"
-version = "1.0.0"
+version = "1.1.0"
 description = "闰土微信记录导出器 — 微信 4.x 聊天记录本地查看与导出（Windows 桌面版）"
 readme = "README.md"
 requires-python = ">=3.11"

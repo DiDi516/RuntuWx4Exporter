@@ -56,6 +56,13 @@ wx4app（PySide6）：QThread 调 LiveSource，主线程只渲染
 - **消息表名 = `Msg_` + md5(会话 username)**，分散在多个 `message_N.db` 分库里，
   发送者必须用**该库自己的 Name2Id**（不同库 rowid 会撞车）。
 - 头像按 **wxid** 查 `head_image.db`，**不是昵称**；消息里的 `_uid` 就是 wxid。
+- **配置**：`config.ini` 放在**应用目录**（打包后 = exe 同级；不可写则回退 `%LOCALAPPDATA%\wx4app`）。
+  结构：`[general]` account_dir / workspace / export_dir / export_layout；
+  `[logging]` enabled / dir / retention_days / level。旧 `config.json` 会自动迁移账号与布局。
+- **工作空间**：`<应用目录>/workspace`，是导出默认目录；「设置」页可改。
+- **日志**：`logging_setup.setup_logging()` 用 `TimedRotatingFileHandler` 按天滚动，
+  `backupCount = retention_days`（默认 30）；默认 `<应用目录>/logs/app.log`，
+  崩溃日志 `crash.log`（faulthandler）同目录。改配置后需重新调用 `setup_logging()`。
 - 模块依赖链：`wx4app → wx4view.live → wx4export.core → wxmanager.wx4 / wx4keys`。
   删掉任何一层，exe 都打不开。
 

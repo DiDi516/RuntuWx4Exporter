@@ -8,7 +8,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QIcon, QPixmap
 
 APP_NAME = "闰土微信记录导出器"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 APP_NAME_EN = "RuntuWeChatExporter"
 
 

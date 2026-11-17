@@ -38,12 +38,12 @@ class TitleBar(QWidget):
     """可拖动标题栏（含窗口按钮）。"""
 
     def __init__(self, window, title_widget: QWidget, show_max: bool = True,
-                 show_min: bool = True, parent=None):
+                 show_min: bool = True, parent=None, margins=(14, 8, 10, 8)):
         super().__init__(parent)
         self._win = window
         self._drag = None
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(14, 8, 10, 8)
+        lay.setContentsMargins(*margins)
         lay.setSpacing(8)
         lay.addWidget(title_widget, 1)
 
@@ -191,7 +191,7 @@ class RoundedDialog(QDialog, _RoundedBase):
         title_box = QWidget()
         tb = QVBoxLayout(title_box)
         tb.setContentsMargins(0, 0, 0, 0)
-        tb.setSpacing(0)
+        tb.setSpacing(4)          # 标题与小字之间留呼吸感
         self.title_label = QLabel(title)
         self.title_label.setObjectName("SetupTitle")
         tb.addWidget(self.title_label)
@@ -200,7 +200,8 @@ class RoundedDialog(QDialog, _RoundedBase):
             self.sub_label.setObjectName("SetupSub")
             self.sub_label.setWordWrap(True)
             tb.addWidget(self.sub_label)
-        self.titlebar = TitleBar(self, title_box, show_max=False, show_min=False)
+        self.titlebar = TitleBar(self, title_box, show_max=False, show_min=False,
+                                 margins=(26, 16, 12, 10))
         hl = QHBoxLayout(head)
         hl.setContentsMargins(0, 0, 0, 0)
         hl.addWidget(self.titlebar)
